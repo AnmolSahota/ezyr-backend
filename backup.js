@@ -9,46 +9,229 @@ app.use(express.json());
 
 const CLIENT_ID = process.env.MY_CLIENT_ID;
 const CLIENT_SECRET = process.env.MY_SECRET_ID;
-const REDIRECT_URI = `${process.env.BACKEND_END_URL}/google/callback`;
-
-const oAuth2Client = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  REDIRECT_URI
-);
-
 const SPREADSHEET_ID = process.env.MY_SPREEDSHEET_ID;
 
-app.get("/auth-url", (req, res) => {
-  const url = oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  res.json({ url });
-});
+// In-memory token storage (use Redis/Database in production)
+const tokenStore = new Map();
 
-app.get("/google/callback", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("No code in query params");
+// Helper function to create OAuth2 client
+const createAuthClient = (redirectUri = null) => {
+  return new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, redirectUri);
+};
+
+// Helper function to check if token is expired or about to expire
+const isTokenExpired = (tokenData) => {
+  if (!tokenData.expires_at) return false;
+
+  // Consider token expired if it expires in next 5 minutes
+  const bufferTime = 5 * 60 * 1000; // 5 minutes
+  return Date.now() > tokenData.expires_at - bufferTime;
+};
+
+// Helper function to refresh access token
+const refreshAccessToken = async (refreshToken, userId = "default") => {
+  try {
+    const authClient = createAuthClient();
+    authClient.setCredentials({
+      refresh_token: refreshToken,
+    });
+
+    console.log("Attempting to refresh token for user:", userId);
+
+    // Refresh the token
+    const { credentials } = await authClient.refreshAccessToken();
+
+    // Store the new token data
+    const tokenData = {
+      access_token: credentials.access_token,
+      refresh_token: credentials.refresh_token || refreshToken, // Keep old refresh token if new one not provided
+      expires_at: credentials.expiry_date || Date.now() + 3600 * 1000,
+      token_type: credentials.token_type || "Bearer",
+    };
+
+    // Store in memory (use your preferred storage)
+    tokenStore.set(userId, tokenData);
+
+    console.log("Token refreshed successfully for user:", userId);
+    return tokenData;
+  } catch (error) {
+    console.error("Token refresh failed:", error.message);
+    throw new Error("Token refresh failed: " + error.message);
+  }
+};
+
+// Middleware to handle token validation and refresh
+const validateAndRefreshToken = async (req, res, next) => {
+  try {
+    let access_token;
+    let refresh_token;
+    let userId = "default"; // Adjust per your user/session logic
+
+    // 1. Prefer Authorization header (always present for GET, often also for POST/PUT)
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      access_token = authHeader.split(" ")[1];
+    }
+
+    // 2. Refresh token: first from custom header, fallback to stored
+    refresh_token =
+      req.headers["x-refresh-token"] || tokenStore.get(userId)?.refresh_token;
+
+    // 3. For POST/PUT: Accept access_token and refresh_token from body, if provided (but do not overwrite from headers if already set)
+    if (req.body && req.body.access_token && !access_token) {
+      access_token = req.body.access_token;
+    }
+    if (req.body && req.body.refresh_token && !refresh_token) {
+      refresh_token = req.body.refresh_token;
+    }
+
+    // 4. Grab expires_at if present in body or from store
+    const expires_at =
+      req.body?.expires_at ?? tokenStore.get(userId)?.expires_at;
+
+    if (!access_token) {
+      return res.status(401).json({ error: "Access token missing" });
+    }
+
+    // 5. Main token object
+    let tokenData = {
+      access_token,
+      refresh_token,
+      expires_at,
+    };
+
+    // 6. Check and refresh if needed
+    if (refresh_token && isTokenExpired(tokenData)) {
+      console.log("Token expired, attempting refresh...");
+      try {
+        tokenData = await refreshAccessToken(refresh_token, userId);
+
+        // Send new token details back for client to store
+        res.set("X-New-Access-Token", tokenData.access_token);
+        res.set("X-Token-Refreshed", "true");
+
+        req.tokenData = tokenData;
+        req.access_token = tokenData.access_token;
+      } catch (refreshError) {
+        return res.status(401).json({
+          error: "Token refresh failed",
+          requiresReauth: true,
+        });
+      }
+    } else {
+      req.tokenData = tokenData;
+      req.access_token = access_token;
+
+      // Store token data for future refresh if available
+      if (refresh_token) {
+        tokenStore.set(userId, tokenData);
+      }
+    }
+
+    next();
+  } catch (error) {
+    console.error("Token validation error:", error);
+    res.status(401).json({ error: "Token validation failed" });
+  }
+};
+
+// OAuth callback endpoint to handle initial token exchange
+app.post("/oauth/callback", async (req, res) => {
+  const { code, redirect_uri } = req.body;
+
+  if (!code) {
+    return res.status(400).json({ error: "Authorization code missing" });
+  }
+
+  console.log("OAuth callback received:", {
+    code: code.substring(0, 20) + "...",
+    redirect_uri,
+    client_id: CLIENT_ID?.substring(0, 10) + "...",
+    has_client_secret: !!CLIENT_SECRET,
+  });
 
   try {
-    const { tokens } = await oAuth2Client.getToken(code);
-    // Send tokens to frontend in query string or JSON
-    res.redirect(
-      `${process.env.FRONT_END_URL}/googlesheet?access_token=${tokens.access_token}&refresh_token=${tokens.refresh_token}`
-    );
-  } catch (err) {
-    res.status(500).send("Error exchanging code for tokens");
+    const authClient = createAuthClient(redirect_uri);
+
+    // Exchange code for tokens
+    const { tokens } = await authClient.getToken(code);
+
+    console.log("Tokens received:", {
+      has_access_token: !!tokens.access_token,
+      has_refresh_token: !!tokens.refresh_token,
+      expires_in: tokens.expiry_date,
+    });
+
+    // Calculate expiration time
+    const expires_at = tokens.expiry_date || Date.now() + 3600 * 1000;
+
+    const tokenData = {
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_at,
+      token_type: tokens.token_type || "Bearer",
+    };
+
+    // Store tokens (use proper user identification in production)
+    const userId = "default";
+    tokenStore.set(userId, tokenData);
+
+    res.json(tokenData);
+  } catch (error) {
+    console.error("OAuth callback error details:", {
+      error: error.message,
+      code: error.code,
+      status: error.status,
+      response: error.response?.data,
+    });
+    res.status(500).json({
+      error: "OAuth exchange failed",
+      details: error.message,
+      debug:
+        process.env.NODE_ENV === "development"
+          ? error.response?.data
+          : undefined,
+    });
   }
 });
 
-app.post("/add-entry", async (req, res) => {
-  const { access_token, values } = req.body;
-  if (!access_token || !values) return res.status(400).send("Missing data");
+// Token refresh endpoint
+app.post("/oauth/refresh", async (req, res) => {
+  const { refresh_token } = req.body;
+
+  if (!refresh_token) {
+    return res.status(400).json({ error: "Refresh token missing" });
+  }
 
   try {
-    const authClient = new google.auth.OAuth2();
-    authClient.setCredentials({ access_token });
+    const tokenData = await refreshAccessToken(refresh_token);
+    res.json(tokenData);
+  } catch (error) {
+    res
+      .status(400)
+      .json({ error: "Token refresh failed", requiresReauth: true });
+  }
+});
+
+// Apply token validation middleware to protected routes
+app.use(
+  [
+    "/add-entry",
+    "/get-entries",
+    "/update-entry",
+    "/delete-entry",
+    "/gmail/search",
+  ],
+  validateAndRefreshToken
+);
+
+app.post("/add-entry", async (req, res) => {
+  const { values } = req.body;
+  if (!values) return res.status(400).json({ error: "Missing values" });
+
+  try {
+    const authClient = createAuthClient();
+    authClient.setCredentials({ access_token: req.access_token });
     const sheets = google.sheets({ version: "v4", auth: authClient });
 
     await sheets.spreadsheets.values.append({
@@ -56,26 +239,29 @@ app.post("/add-entry", async (req, res) => {
       range: "Sheet1!A1",
       valueInputOption: "RAW",
       requestBody: {
-        values: [values], // e.g. ["Name", "Email"]
+        values: [values],
       },
     });
 
     res.json({ status: "success" });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Error adding entry");
+    console.error("Add entry error:", err);
+
+    // Check if it's an auth error
+    if (err.code === 401 || err.code === 403) {
+      return res
+        .status(401)
+        .json({ error: "Authentication failed", requiresReauth: true });
+    }
+
+    res.status(500).json({ error: "Error adding entry" });
   }
 });
 
-// 📥 Get all rows from Google Sheet
-
 app.get("/get-entries", async (req, res) => {
-  const access_token = req.headers.authorization?.split(" ")[1];
-  if (!access_token) return res.status(400).send("Access token missing");
-
   try {
-    const authClient = new google.auth.OAuth2();
-    authClient.setCredentials({ access_token });
+    const authClient = createAuthClient();
+    authClient.setCredentials({ access_token: req.access_token });
     const sheets = google.sheets({ version: "v4", auth: authClient });
 
     const response = await sheets.spreadsheets.values.get({
@@ -83,12 +269,10 @@ app.get("/get-entries", async (req, res) => {
       range: "Sheet1!A1:B1000",
     });
 
-    // Filter out empty rows
     const rows = (response.data.values || []).filter(
       (row) => row && row.length > 0 && row[0].trim() !== ""
     );
 
-    // Transform rows here before sending
     const transformedRecords = rows.map((entry, index) => ({
       id: index,
       fields: {
@@ -99,54 +283,62 @@ app.get("/get-entries", async (req, res) => {
 
     res.json({ data: transformedRecords });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Failed to fetch entries");
+    console.error("Get entries error:", err);
+
+    if (err.code === 401 || err.code === 403) {
+      return res
+        .status(401)
+        .json({ error: "Authentication failed", requiresReauth: true });
+    }
+
+    res.status(500).json({ error: "Failed to fetch entries" });
   }
 });
 
-// 📝 Update a row
 app.put("/update-entry", async (req, res) => {
-  const { access_token, rowIndex, values } = req.body;
-  if (!access_token || rowIndex === undefined || !values)
-    return res.status(400).send("Missing data");
+  const { rowIndex, values } = req.body;
+  if (rowIndex === undefined || !values) {
+    return res.status(400).json({ error: "Missing data" });
+  }
 
   try {
-    const authClient = new google.auth.OAuth2();
-    authClient.setCredentials({ access_token });
+    const authClient = createAuthClient();
+    authClient.setCredentials({ access_token: req.access_token });
     const sheets = google.sheets({ version: "v4", auth: authClient });
 
-    // Fix: rowIndex + 1 instead of rowIndex + 2
-    // If rowIndex is 0 (first data row), we want to update row 1 (A1)
-    // If your sheet has headers in row 1, then use rowIndex + 2
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `Sheet1!A${rowIndex + 1}`, // Changed from rowIndex + 2 to rowIndex + 1
+      range: `Sheet1!A${rowIndex + 1}`,
       valueInputOption: "RAW",
       requestBody: { values: [values] },
     });
 
     res.json({ status: "updated" });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Error updating entry");
+    console.error("Update entry error:", err);
+
+    if (err.code === 401 || err.code === 403) {
+      return res
+        .status(401)
+        .json({ error: "Authentication failed", requiresReauth: true });
+    }
+
+    res.status(500).json({ error: "Error updating entry" });
   }
 });
 
-// 🗑️ Delete entire row (shift rows up)
 app.delete("/delete-entry", async (req, res) => {
-  const { access_token, rowIndex } = req.body;
-  if (!access_token || rowIndex === undefined)
-    return res.status(400).send("Missing data");
+  const { rowIndex } = req.body;
+  if (rowIndex === undefined) {
+    return res.status(400).json({ error: "Missing rowIndex" });
+  }
 
   try {
-    const authClient = new google.auth.OAuth2();
-    authClient.setCredentials({ access_token });
+    const authClient = createAuthClient();
+    authClient.setCredentials({ access_token: req.access_token });
     const sheets = google.sheets({ version: "v4", auth: authClient });
 
-    // rowIndex is zero-based from frontend data array
-    // Sheet rows start at 1, header is row 1, data rows start at 2
-    // So actual sheet row to delete = rowIndex + 1 (0-based to 1-based) + 1 (header) = rowIndex + 2
-    const sheetRowToDelete = rowIndex + 1; // same as rowIndex + 2
+    const sheetRowToDelete = rowIndex + 1;
 
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
@@ -155,10 +347,10 @@ app.delete("/delete-entry", async (req, res) => {
           {
             deleteDimension: {
               range: {
-                sheetId: 0, // Usually 0 for first sheet. Confirm with your sheet's actual ID.
+                sheetId: 0,
                 dimension: "ROWS",
-                startIndex: sheetRowToDelete - 1, // zero-based, inclusive
-                endIndex: sheetRowToDelete, // exclusive, so only one row
+                startIndex: sheetRowToDelete - 1,
+                endIndex: sheetRowToDelete,
               },
             },
           },
@@ -168,58 +360,25 @@ app.delete("/delete-entry", async (req, res) => {
 
     res.json({ status: "deleted" });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Error deleting entry");
+    console.error("Delete entry error:", err);
+
+    if (err.code === 401 || err.code === 403) {
+      return res
+        .status(401)
+        .json({ error: "Authentication failed", requiresReauth: true });
+    }
+
+    res.status(500).json({ error: "Error deleting entry" });
   }
 });
-
-// Scope needed for Gmail read-only access
-const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"];
-
-// OAuth client instance for Gmail (same client ID/secret can be used if enabled)
-const oAuth2ClientGmail = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  `${process.env.BACKEND_END_URL}/google/callback-gmail`
-);
-
-// Step 1: Get Gmail auth URL (for OAuth login)
-app.get("/auth-url-gmail", (req, res) => {
-  const url = oAuth2ClientGmail.generateAuthUrl({
-    access_type: "offline",
-    scope: GMAIL_SCOPES,
-    prompt: "consent",
-  });
-  res.json({ url });
-});
-
-// Step 2: Handle Gmail OAuth callback
-app.get("/google/callback-gmail", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("No code in query params");
-
-  try {
-    const { tokens } = await oAuth2ClientGmail.getToken(code);
-    // Redirect to frontend with tokens in query string
-    res.redirect(
-      `${process.env.FRONT_END_URL}/gmail?access_token=${tokens.access_token}&refresh_token=${tokens.refresh_token}`
-    );
-  } catch (err) {
-    console.error("Gmail OAuth callback error:", err);
-    res.status(500).send("Error exchanging code for tokens");
-  }
-});
-
-// Step 3: Gmail email search endpoint
 
 app.post("/gmail/search", async (req, res) => {
-  const { access_token, query } = req.body;
-  if (!access_token) return res.status(400).send("Access token missing");
-  if (!query) return res.status(400).send("Search query missing");
+  const { query } = req.body;
+  if (!query) return res.status(400).json({ error: "Search query missing" });
 
   try {
-    const authClient = new google.auth.OAuth2();
-    authClient.setCredentials({ access_token });
+    const authClient = createAuthClient();
+    authClient.setCredentials({ access_token: req.access_token });
 
     const gmail = google.gmail({ version: "v1", auth: authClient });
 
@@ -240,7 +399,6 @@ app.post("/gmail/search", async (req, res) => {
           metadataHeaders: ["From", "Subject", "Date"],
         });
 
-        // Flatten headers into fields
         const headersArray = messageDetail.data.payload.headers || [];
         const fields = {
           Snippet: messageDetail.data.snippet,
@@ -262,11 +420,35 @@ app.post("/gmail/search", async (req, res) => {
     res.json({ records: detailedRecords });
   } catch (err) {
     console.error("Gmail search error:", err);
-    res.status(500).send("Error searching emails");
+
+    if (err.code === 401 || err.code === 403) {
+      return res
+        .status(401)
+        .json({ error: "Authentication failed", requiresReauth: true });
+    }
+
+    res.status(500).json({ error: "Error searching emails" });
   }
 });
 
-const PORT = process.env.PORT;
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Debug endpoint to check OAuth configuration
+app.get("/oauth/debug", (req, res) => {
+  res.json({
+    client_id: CLIENT_ID ? CLIENT_ID.substring(0, 20) + "..." : "NOT_SET",
+    client_secret: CLIENT_SECRET
+      ? "SET (length: " + CLIENT_SECRET.length + ")"
+      : "NOT_SET",
+    spreadsheet_id: SPREADSHEET_ID ? "SET" : "NOT_SET",
+    environment: process.env.NODE_ENV || "development",
+  });
+});
+
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () =>
   console.log(`Server started at http://localhost:${PORT}`)
 );
